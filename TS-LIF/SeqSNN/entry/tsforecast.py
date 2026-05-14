@@ -41,6 +41,14 @@ def run_train(config):
         out_size=config.runner.out_size or trainset.num_classes,
     )
 
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.config.update(config.asdict(), allow_val_change=True)
+            print("[WandbConfig] Successfully logged all YAML configuration arguments.")
+    except Exception as e:
+        print(f"[WandbConfig] Warning: Could not log complete config to Weights & Biases: {e}")
+
     runner.fit(trainset, validset, testset)
     #print('456')
     runner.predict(trainset, "train")
@@ -56,7 +64,7 @@ if __name__ == "__main__":
     # config_yaml = yaml.load(open(onfig_yaml, "r"), Loader=yaml.FullLoader)
     # _config = SeqSNNConfig(**config_yaml)
     # run_train(_config)
-    sys.argv = ["python", "/home/feng/feng5/timeseries/exp/forecast/spikegru/spikegru_electricity.yml"]
+    # sys.argv = ["python", "/home/feng/feng5/timeseries/exp/forecast/spikegru/spikegru_electricity.yml"]
 
     # sys.argv = ["python", "/home/feng/feng5/timeseries/exp/forecast/ispikformer/ispikformer_electricity.yml"]
     # config_file_path = "/home/feng/feng5/timeseries/exp/forecast/spikegru/spikegru_electricity.yml"

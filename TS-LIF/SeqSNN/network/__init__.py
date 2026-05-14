@@ -9,4 +9,4 @@ from .snn.spike_tcn import SpikeTemporalConvNet2D, SpikeTemporalBlock2D
 from .snn.ispikformer import iSpikformer
 from .snn.spikformer import Spikformer
 from .snn.spikformer_CPG import SpikformerCPG
-from .snn.spikernn import SpikeRNN, SpikeRNN2D
+# from .snn.spikernn import SpikeRNN, SpikeRNN2D

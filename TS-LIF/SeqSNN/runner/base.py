@@ -15,6 +15,8 @@ from utilsd import use_cuda
 from utilsd.config import Registry
 from utilsd.earlystop import EarlyStop, EarlyStopStatus
 
+from tqdm import tqdm
+import wandb
 from ..common.function import get_loss_fn, get_metric_fn, printt
 from ..common.utils import AverageMeter, GlobalTracker, to_torch
 from SeqSNN.runner.utils import reset_states
@@ -63,9 +65,10 @@ class BaseRunner(nn.Module):
         if model_path is not None:
             self.load(model_path)
         # multi gpu
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         if torch.cuda.is_available():
-            print("Using GPU")
-            self.cuda(device=3)
+            print(f"Using GPU: {self.device}")
+            self.to(self.device)
 
     def _build_network(self, network, *args, **kwargs) -> None:
         # TODO: encoder decoder decompose
@@ -125,6 +128,19 @@ class BaseRunner(nn.Module):
         """
         self.writer = SummaryWriter(log_dir)
         self.writer.flush()
+        
+        try:
+            run_name = log_dir.name if log_dir else "run"
+            wandb.init(
+                project="TS-LIF",
+                name=run_name,
+                config=self.hyper_paras,
+                dir=log_dir.parent if log_dir else None,
+                sync_tensorboard=False
+            )
+            print(f"Weights & Biases initialized successfully for project 'TS-LIF', run: '{run_name}'")
+        except Exception as e:
+            print(f"Could not initialize Weights & Biases (proceeding with TensorBoard only): {e}")
 
     def forward(self, inputs: torch.Tensor):
         """The pytorch module forward function
@@ -195,6 +211,10 @@ class BaseRunner(nn.Module):
         best_epoch = best_res.pop("best_epoch", 0)
         best_score = self.early_stop.best
 
+        from SeqSNN.runner.hooks import SpikeMetricsTracker
+        spike_tracker = SpikeMetricsTracker(self.network, enabled=False)
+        plasticity_interval = 100
+
         # main loop
         for epoch in range(start_epoch, self.max_epoches):
             # pre_epoch
@@ -204,11 +224,15 @@ class BaseRunner(nn.Module):
             start_time = time.time()
 
             # batch loop
-            for data, label in loader:
+            for data, label in tqdm(loader, desc=f"Epoch {epoch} [Train]"):
                 # pre batch / fetch data
+                do_plasticity = (iterations % plasticity_interval == 0)
+                if do_plasticity:
+                    spike_tracker.enabled = True
+                    spike_tracker.reset()
                 if use_cuda():
-                    data, label = to_torch(data, device="cuda:3"), to_torch(
-                        label, device="cuda:3"
+                    data, label = to_torch(data, device=self.device), to_torch(
+                        label, device=self.device
                     )
                 reset_states(model=self.network.net[0].tslif)
                 # Avoid error, TS-former !!
@@ -261,6 +285,10 @@ class BaseRunner(nn.Module):
                 # forward_once data -> dict ["loss"]
                 pred = self(data)
 
+                if do_plasticity:
+                    spikes_before = spike_tracker.get_assembled_spikes()
+                    spike_tracker.reset()
+
                 # flops = FlopCountAnalysis(self.network, data)
                 # print('11', flops.total() / 1e9)
                 # counts = parameter_count_table(self.network)
@@ -275,6 +303,39 @@ class BaseRunner(nn.Module):
 
                 torch.nn.utils.clip_grad_norm_(self.parameters(), 1)
                 self.optimizer.step()
+
+                if do_plasticity:
+                    # Run dual pass for "after" update spikes
+                    with torch.no_grad():
+                        # Ensure states are completely aligned by performing master resets
+                        try:
+                            reset_states(model=self.network.net[0].tslif)
+                        except Exception:
+                            pass
+                        try:
+                            reset_states(model=self.network)
+                        except Exception:
+                            pass
+                        
+                        _ = self(data)
+                    
+                    spikes_after = spike_tracker.get_assembled_spikes()
+                    spike_tracker.enabled = False
+                    
+                    if spikes_before:
+                        try:
+                            # Identify the time sequence length T
+                            first_tensor = next(iter(spikes_before.values()))
+                            T = first_tensor.shape[1] 
+                            
+                            # Compute the specified plasticity & entropy metrics
+                            plasticity_metrics = spike_tracker.compute_metrics(spikes_before, spikes_after, T)
+                            
+                            # Log straight to weights & biases
+                            wandb.log(plasticity_metrics, step=iterations)
+                        except Exception as e:
+                            print(f"[BaseRunner] Plasticity logging error: {e}")
+
                 loss = loss.item()
                 train_loss.update(loss, np.prod(label.shape))
                 train_global_tracker.update(label, pred)
@@ -312,6 +373,7 @@ class BaseRunner(nn.Module):
             print(f"{datetime.datetime.today()}")
             for k, v in metric_res.items():
                 self.writer.add_scalar(f"{k}/train", v, epoch)
+                wandb.log({f"train/{k}": v}, step=epoch)
             self.writer.flush()
 
             if validset is not None:
@@ -367,6 +429,7 @@ class BaseRunner(nn.Module):
                 test_res = self.evaluate(testset)
             for k, v in test_res.items():
                 self.writer.add_scalar(f"{k}/test", v, epoch)
+                wandb.log({f"test/{k}": v}, step=epoch)
             value = test_res[self.observe]
             best_score = value
             best_res["test"] = test_res
@@ -383,6 +446,9 @@ class BaseRunner(nn.Module):
         self.writer.add_hparams(
             self.hyper_paras, {"result": best_score, "best_epoch": best_epoch}
         )
+
+        # Remove hooks to avoid memory leaks
+        spike_tracker.remove()
 
         return self
 
@@ -410,7 +476,7 @@ class BaseRunner(nn.Module):
     def _resume(self):
         if (self.checkpoint_dir / "resume.pth").exists():
             print(f"Resume from {self.checkpoint_dir / 'resume.pth'}", __name__)
-            checkpoint = torch.load(self.checkpoint_dir / "resume.pth")
+            checkpoint = torch.load(self.checkpoint_dir / "resume.pth", map_location=self.device)
             self.early_stop.load_state_dict(checkpoint["earlystop"])
             self.load_state_dict(checkpoint["model"])
             self.optimizer.load_state_dict(checkpoint["optim"])
@@ -444,10 +510,10 @@ class BaseRunner(nn.Module):
         start_time = time.time()
         validset.load()
         with torch.no_grad():
-            for _, (data, label) in enumerate(loader):
+            for _, (data, label) in enumerate(tqdm(loader, desc=f"Epoch {epoch} [Eval]", leave=False)):
                 if use_cuda():
-                    data, label = to_torch(data, device="cuda:3"), to_torch(
-                        label, device="cuda:3"
+                    data, label = to_torch(data, device=self.device), to_torch(
+                        label, device=self.device
                     )
                 reset_states(model=self.network.net[0].tslif)
                 # Avoid error, TS-former !!
@@ -523,6 +589,7 @@ class BaseRunner(nn.Module):
             print(f"{datetime.datetime.today()}")
             for k, v in metric_res.items():
                 self.writer.add_scalar(f"{k}/valid", v, epoch)
+                wandb.log({f"valid/{k}": v}, step=epoch)
 
         return metric_res
 
@@ -557,7 +624,7 @@ class BaseRunner(nn.Module):
         )
         for data, _ in loader:
             if use_cuda():
-                data = to_torch(data, device="cuda:3")
+                data = to_torch(data, device=self.device)
             reset_states(model=self.network.net[0].tslif)
             # Avoid error  TS-former !!
             # reset_states(model=self.network.encoder.tc_lif)

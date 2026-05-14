@@ -4,7 +4,7 @@ import numpy as np
 def reset_states(model):
     for m in model.modules():
         if hasattr(m, 'reset'):
-            if not isinstance(m, TSLIF_base.MemoryModule):
+            if not isinstance(m, TSLIF_base.MemoryModule) and m.__class__.__name__ != 'Leaky':
                 print(f'Trying to call `reset()` of {m}, which is not base.MemoryModule')
             m.reset()
 

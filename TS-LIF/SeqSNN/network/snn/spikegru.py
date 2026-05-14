@@ -13,6 +13,8 @@ from SeqSNN.network.snn.TSLIF import *
 from SeqSNN.network.snn.surrogate import atan as SG
 
 def introduce_missing_values(data, missing_ratio, fill_value=0.0):
+    if missing_ratio == 0.0:
+        return data
     m_data = data.clone()
     elements = m_data.numel()
     num_missing = int(elements * missing_ratio)
